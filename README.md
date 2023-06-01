@@ -12,4 +12,4 @@ This is a major work in development and it progresses/improves as I learn more e
 ## Contributions
 The code is based on Dr. Ian Morgan's StePy repository (found [here](https://github.com/ianlmorgan/StePy)). 
 
-All major modifications so far have been developed by me, Dillon Balthrop of Dr. Maria Mills' lab at University of Missouri - Columbia. The GUI was also coded by me.
+All major modifications so far have been developed by me, Dillon Balthrop. The GUI was also coded by me.
