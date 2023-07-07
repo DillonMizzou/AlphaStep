@@ -526,6 +526,14 @@ def WriteOutput(df,file,headbool):
     with open(file, 'a', newline = '') as f:
         df.to_csv(f, index = False, header = headbool)
 
+################################################################################################################
+        
+def WriteOutFile2(table, file):    
+    # Write list of lists to output file since that is how PySimpleGUI uses tables
+    with open(file, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerows(table)
+        
 ################################################################################################################        
         
 def ClearOutFile(file):
