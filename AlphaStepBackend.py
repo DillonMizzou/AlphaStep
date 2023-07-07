@@ -1,0 +1,635 @@
+""" Purpose: Program to analyze Step-Wise behavior that occurs in Single-Molecule time series data. Also includes functions for
+Boxcar (moving-window average) smoothing, Savitzky-Golay filtering, cubic B-spline smoothing, writing data to an output file,
+a moving-window Student's T-Test, an algorithm to determine the optimal window size for that T-test, and a function to determine
+the optimal size for a Savitzky-Golay filter for arbitrary order and data set.
+
+Author: Dillon Balthrop (2023), dsbdxg@mail.missouri.edu, dillon.balthrop@gmail.com
+
+Lab: Prof. Maria Mills, University of Missouri
+
+"""
+import math as mth
+import numpy as np
+import scipy as sc
+import scipy.stats as stats
+from scipy.stats import ttest_ind
+from scipy.signal import savgol_filter
+from scipy.interpolate import UnivariateSpline
+import matplotlib.pyplot as plt
+from matplotlib.cbook import contiguous_regions
+from matplotlib.ticker import FormatStrFormatter
+import csv
+import lmfit as lm
+from lmfit.models import ConstantModel, StepModel
+import statistics as st
+import astropy
+from astropy.convolution import convolve, Box1DKernel
+import warnings
+import pandas as pd
+import IPython
+
+warnings.filterwarnings('ignore')
+plt.rcdefaults()
+
+def PlottingParams(palette = "default"):
+    if palette == "dark":
+        plt.style.use('dark_background')
+    elif palette == "solarized":
+        plt.style.use('Solarize_Light2')
+    elif palette == "grayscale":
+        plt.style.use('grayscale')
+    else:
+        plt.style.use('default')
+    plt.rc('xtick',direction='in',labelsize=18,top=True)
+    plt.rc('xtick.minor',visible=True,size=5)
+    plt.rc('xtick.major',size=8,width=1)
+    plt.rc('ytick',direction='in',labelsize=18,right=True)
+    plt.rc('ytick.minor',visible=True,size=5)
+    plt.rc('ytick.major',size=8,width=1)
+
+    plt.rc('axes',labelsize=30,linewidth=1.5)
+    plt.rc('figure',figsize=(6,4))
+    plt.rc('figure.subplot',wspace=0.02,hspace=0.02)
+    plt.rc('legend',fontsize=12,frameon=True,framealpha=0.6,markerscale=1,handlelength=2)
+    plt.rc('grid', alpha=0.5,linewidth=0.4)
+    plt.rc('savefig',bbox='tight',transparent=False)
+    #plt.rcParams['axes.linewidth'] = 2
+    plt.rc('font',family='Times New Roman')
+    plt.rc('mathtext',fontset='stix')
+
+        
+    
+
+# mpl.rcParams["font.family"]='Times New Roman'
+# mpl.rcParams["mathtext.fontset"]='stix'
+
+from IPython.display import display, Latex
+
+def rolling_ttest(trace,
+                  window_length=60,
+                  **kwargs):
+    
+    """Calculate a rolling ttest metric.
+    Arrgs:
+        trace (array_like): A one-dimensional array of a single-molecule signal.
+        window_length (int, optional): Length of window. Defaults to 100.
+    Returns:
+        (tscore,pvalue): Tscore and pvalue for each point from trace.
+    """
+    # Adds reflected values on either side of trace to avoid edge effects
+    a = np.pad(trace, window_length, 'reflect') # [1,2,3,4,5] -> [2,1,2,3,4,5,4]
+    # Creates a sliding window view
+    a = np.lib.stride_tricks.sliding_window_view(a, window_length)[:-1]
+    tscore, pvalue = ttest_ind(a[window_length:].T,  # all windows before point
+                               a[:-window_length].T,  # all windows after point
+                               **kwargs)
+    return tscore, pvalue
+
+def Pad_Data(data, front_padding = 0, end_padding = 0):
+    trace = np.pad(data,(front_padding,0),mode = 'constant', constant_values=data[0])
+    trace = np.pad(trace, (0, end_padding), mode = 'constant', constant_values = trace[len(trace)-1])
+    return trace
+class fit_signal:
+    
+    ################################################################################################################
+    ### INITIALIZATION PARAMTERS FOR THE CLASS ###
+    ##############################################
+    
+    def __init__(self,
+                 trace,
+                 dt=1, # data frequency (1/fps)
+                 window_length=30, # Window size for the t-test
+                 method='ttest', # step determination method (currently only has t-test)
+                 min_threshold=0.005, # declares the p-value that qualifies a 'null' region, not a step
+                 max_threshold=0.00005, # once a p-value crosses this threshold, it is counted as a step
+                 exclusion = 0.8, # threshold to exclude step sizes that do not reach this value
+                 smth = 5000,
+                 **kwargs) -> None:
+        """Calculate fit signal
+        Arrgs:
+            trace (_type_): _description_
+            dt (int, optional): _description_. Defaults to 1.
+            window_length (int, optional): _description_. Defaults to 100.
+            method (str, optional): _description_. Defaults to 'ttest'.
+            min_threshold (float, optional): _description_. Defaults to 0.05.
+            max_threshold (float, optional): _description_. Defaults to 0.005.
+        """
+        self.exclusion = exclusion
+        self.trace = trace
+        time = np.arange(dt, trace.size*dt+dt, dt)
+        self.time = time
+        if method == 'ttest':
+            self.score, self.pvalue = rolling_ttest(trace,
+                                                    window_length,
+                                                    **kwargs)      
+            regions = contiguous_regions(self.pvalue < min_threshold)  # Makes a 1D array including all points, but masks points that don't meet the pvalue < min criteria
+            
+            # Filter out regions that are shorter than window_length
+            msk = np.ravel(np.diff(regions) >= window_length)          # 1-> Determines separation between                                                                     
+            regions = np.array(regions)[msk]                           # 2-> Applies mask to regions array and reassigns to eliminate masked values from the array
+            
+            # Filter out regions with no pvalues greater than max_threshold            
+            regions = np.array([r for r in regions if any(
+                self.pvalue[slice(*r)] < max_threshold)])
+            
+            # Create loose threshold for amplitude difference between regions
+            c = np.array(regions[0])      # c = array of filtered regions
+            count = 1
+            for i in regions:
+                if np.abs(np.mean(self.trace[i[1]:(i[1]+window_length)])-np.mean(self.trace[(i[0]-window_length):i[0]])) > self.exclusion: # Basic threshold filter by user-defined value
+                    #print("Region %i" %count, ": ", np.mean(self.trace[i[1]:(i[1]+window_length)])-np.mean(self.trace[(i[0]-window_length):i[0]])) 
+                    count += 1
+                    d = np.array([i[0],i[1]])
+                    c = np.vstack((c,d))
+            regions = c 
+            self.regions = regions # Defines the filtered array as the array of steps to be fitted
+            print("Number of steps detected:",np.size(self.regions,axis=0))
+    
+    ################################################################################################################
+    ### PLOTTING THE FIT AND P-VALUES ###
+    #####################################
+    
+    def plot(self,
+             raw = 'default', # Raw data to be used
+             colors = 'light', # Changes the color pallete from light to dark
+             replotted = False,
+             filtersize = 91, # The filters used for smoothing require a window to scoot along the data
+                              # and it must be an odd number
+             filtertype = 'SG'): # The filter type can either be 'SG' (Savitzky-Golay) or
+                                 # or 'boxcar' (sliding-window average)
+            
+        """ FUNCTION'S PURPOSE:
+        
+        This function creates a figure consisting of 2 subplots stacked vertically. The top (ax[0]) plots  
+        a curve of the p-values obtained from the t-test, which is shown in black. Then the regions with steps
+        are plotted over in color to make them easily identifiable. In the lower plot (ax[1]) the raw data, fit
+        from LMfit, and a smoothed trace of the dataset are plotted. Both the raw data and smoothed data exist 
+        to aid the users eye in judging the quality of the fit.
+        
+        """
+        if colors == 'dark':
+            FitLineColor = "yellowgreen"
+            DataColor = "dimgray"
+            PLineColor = "gray"
+            FilterColor = "violet"
+            StepRegionColor = None
+        elif colors == 'grayscale':
+            FitLineColor = 'red'
+            DataColor = 'gray'
+            PLineColor = None
+            FilterColor = 'black'
+            StepRegionColor = 'red'
+        elif colors == 'solarized':
+            FitLineColor = None
+            DataColor = 'gray'
+            PLineColor = 'k'
+            FilterColor = None  
+            StepRegionColor = 'red'
+        elif colors == 'Chunfeng':
+            FitLineColor = 'k'
+            DataColor = 'darkgray'
+            PLineColor = 'darkgray'
+            FilterColor = 'salmon'  
+            StepRegionColor = None
+        else:
+            FitLineColor = "k"
+            DataColor = "silver"
+            PLineColor = "silver"
+            FilterColor = 'r'
+            StepRegionColor = None
+
+        raw = raw
+        
+        #################################
+        ### CREATE THE SUBPLOT CANVAS ###
+        #################################
+        
+        fig, ax = plt.subplots(2, sharex=True,
+                   gridspec_kw={'hspace': 0.05,
+                                'height_ratios': [1, 2]})
+        
+        ###################################################################
+        ### PLOTTING MATERIALS TO AID THE USERS EYES IN JUDGING RESULTS ###
+        ###################################################################
+        
+        ax[1].plot(self.time, raw, color = DataColor, alpha = 1, lw = .8, label = 'Raw Data') # Plots raw data for visual aid in background
+        if filtertype == None:
+            pass
+        if filtertype == 'SG': #smoothes the data with an SG filter and plots it with the result
+            savgo = savgol_filter(self.trace, filtersize, 4)
+            ax[1].plot(self.time,savgo,color = FilterColor, alpha=1, ls = '-', lw = 1, label = 'SG Filter (WS: %i)' %filtersize)
+        if filtertype == 'Boxcar': #smoothes the data with an Boxcar filter and plots it with the result   
+            boxed = Boxsmooth(self.trace, 31)
+            ax[1].plot(self.time,boxed,color = FilterColor, alpha=1, ls = '-', lw = 1, label = 'Boxcar, WS: %i' %filtersize)         
+        
+        
+        #############################
+        ### PLOTTING THE P-VALUES ###
+        #############################
+        
+        # Plots a continuous curve of the p-values from the t-test at each data point and then overlays color-coded curves for regions containing steps
+        ax[0].semilogy(self.time, self.pvalue,color = PLineColor, linewidth = 0.75) # Plots the p-values
+        ax[0].grid(color = 'silver', linestyle = '--', linewidth =.5, which = 'both')
+        if replotted == False:
+            for r in self.regions[:]: # Loops through the step regions but doesn't out steps that don't pass threshold size
+                ax[0].semilogy(self.time[slice(*r)], self.pvalue[slice(*r)],linewidth= 1.1, color = StepRegionColor)
+        else:
+             for r in self.regions[:][self.resmask]: # Loops through the step regions but masks out steps that don't pass threshold size
+                ax[0].semilogy(self.time[slice(*r)], self.pvalue[slice(*r)],linewidth= 1.1, color = StepRegionColor)
+        #########################################
+        ### PLOT THE FITTED MODEL TO THE DATA ###
+        #########################################
+        
+        if hasattr(self, "output"): 
+            ax[1].plot(self.time, self.trace + self.output.residual,color = FitLineColor,linewidth = 1.1, label = 'Fitted Model')
+        
+        #############################
+        ### BASIC PLOT PARAMETERS ###
+        #############################
+        
+        ax[0].set_ylabel("P-value")
+        ax[1].set_ylabel(r"Turns Resolved [$\Delta Lk$]")
+        ax[1].set_xlabel("Time [s]")
+        ax[1].grid()
+        ax[1].legend()
+        fig.align_labels()
+        fig.set_size_inches(8,10)
+        plt.savefig('fit.svg', transparent = False)
+        plt.show()
+        
+        return fig
+    
+    ################################################################################################################
+    ### FITTING THE DATA USING LMFIT ###
+    ####################################
+
+    def fit(self,
+            dt, # Time frequency (1/fps)
+           refitted = False,
+            results = False,
+            maxiter = None,
+           **kwargs): 
+        
+        """ FUNCTION'S PURPOSE:
+        
+        This function fits the data set by providing a constant model to the regions where no steps were detected
+        and fitting linear steps to regions where they were detected. This is done using the LMfit package. First,
+        estimates from the located steps are gotten using basic methods, providing information to LMfit so it may
+        guess the parameters needed more quickly. Then a system of dictionaries is utilized to record and update values
+        as needed, as well as providing an easy method for dumping them to pandas to tabulated and save them.
+        
+        NOTE:: Honestly, the obtaining of the results is very clumsy and should be improved using better list comprehension
+        techniques.
+        
+        """
+        datlist = self.trace 
+        time, trace = self.time, self.trace
+        if refitted == True:
+            self.regions = self.regions[:][self.resmask]
+        model = ConstantModel() # Creates a constant model for areas between steps (y = b format)
+        params = model.make_params(c=trace[:10].mean()) # identifies the mean for the constant model using the first 10 points of the slice
+
+        #############################################################
+        ### Give estimates for parameters so LMfit can do its job ###
+        #############################################################
+        count = 0
+        for i, r in enumerate(self.regions): # Creates a counter in 'i' and uses it as an index for 
+                                                # the items 'r'; example: https://www.geeksforgeeks.org/enumerate-in-python/
+            stime = time[slice(*r)]
+            strace = trace[slice(*r)]
+            xmax, xmin = max(stime), min(stime)
+            ymax, ymin = max(strace), min(strace)
+
+            sigma = (xmax-xmin)/2
+            step = StepModel(prefix=f"s{i}_")
+
+            params.add(f"s{i}_amplitude", value=ymax-ymin) 
+            params.add(f"s{i}_center", value=xmin + sigma)
+            params.add(f"s{i}_sigma", value=sigma, min=0,
+                       max=2*sigma)
+            model += step
+            count += 1
+        self.output = model.fit(trace, params, x = time)
+
+        ############################################
+        ### GET THE NECCESSARY VALUES FOR OUTPUT ###
+        ############################################
+
+        #Processivity#
+        StepAmpArr = np.array(self.results['step_height'])
+        AverageTurns= StepAmpArr[StepAmpArr > 0].mean() 
+        Processivity = np.array([])
+        for i in range(len(self.results['step_height'])-1): 
+            Processivity= np.hstack((Processivity,np.nan))
+        Processivity= np.hstack((Processivity,AverageTurns))
+        Processivity = Processivity.tolist()
+
+        #Average Rates#
+        RateArr = np.array(self.results['step_rate'])
+        AverageRate= RateArr[RateArr > 0].mean() 
+        AverageRateArr = np.array([])
+        for i in range(len(self.results['step_rate'])-1): 
+            AverageRateArr= np.hstack((AverageRateArr,np.nan))
+        AverageRateArr= np.hstack((AverageRateArr,AverageRate))
+        AverageRateArr = AverageRateArr.tolist()
+
+        #Average Dwells#
+        DwellArr = np.array(self.results['dwell_time'])
+        AverageDwell= DwellArr[DwellArr > 0].mean() 
+        AverageDwellArr = np.array([])
+        for i in range(len(self.results['dwell_time'])-1): 
+            AverageDwellArr= np.hstack((AverageDwellArr,np.nan))
+        AverageDwellArr= np.hstack((AverageDwellArr,AverageDwell))
+        AverageDwellArr = AverageDwellArr.tolist()
+
+        #Average Step Time Periods (Widths)#
+        WidthArr = np.array(self.results['step_width'])
+        AverageWidth= WidthArr[1:].mean() 
+        AverageWidthArr = np.array([])
+        for i in range(len(self.results['step_width'])-1): 
+            AverageWidthArr= np.hstack((AverageWidthArr,np.nan))
+        AverageWidthArr= np.hstack((AverageWidthArr,AverageWidth))
+        AverageWidthArr = AverageWidthArr.tolist()
+
+        #Getting Positions of Dwell Starts#
+        DwellStartArr = np.array([])
+        DwellIndex = np.array([])
+        for i in range(len(self.results['dwell_time'])):
+            DwellIndex = np.hstack((DwellIndex,np.rint((self.results['step_start'][i]+self.results['step_width'][i])/dt)));
+        for i in range(len(DwellIndex)):
+            DwellPosition = self.trace[DwellIndex[i].astype(int)]+self.output.residual[DwellIndex[i].astype(int)]
+            DwellStartArr = np.hstack((DwellStartArr,DwellPosition))    
+            
+        #Getting Positions of Step Occurances to Correllate Step Size With How Many Turns Were Undone Up To That Point#
+        
+        StepPosArr = np.array([])
+        StepIndices = np.array([])
+        for i in range(len(self.results['step_start'])):
+            StepIndices = np.hstack((StepIndices, np.rint(self.results['step_start'][i]/dt)))
+        for i in range(len(StepIndices)):
+            TempPos = self.trace[StepIndices[i].astype(int)]+self.output.residual[StepIndices[i].astype(int)]
+            StepPosArr = np.hstack((StepPosArr,TempPos))
+                
+        #Get OV Rate#
+        OVRateArr = np.array([])
+        OVDwell = np.sum(self.results['dwell_time'],where = findpositives(self,self.results['dwell_time'])) \
+                + np.sum(self.results['step_width'],where = findpositives(self,self.results['step_width']))
+        OVAmp = np.sum(self.results['step_height'], where = findpositives(self,self.results['step_height']))
+        OVRate = OVAmp/OVDwell
+        for i in range(len(self.results['step_height'])-1):
+            OVRateArr = np.hstack((OVRateArr,np.nan))
+        OVRateArr = np.hstack((OVRateArr,OVRate))
+
+        #Recording the total dwell time and total turns#
+        TotDwellArr = np.array([])
+        TotTurnArr = np.array([])
+        for i in range(len(self.results['dwell_time'])-1):
+            TotDwellArr = np.hstack((TotDwellArr,np.nan))
+            TotTurnArr = np.hstack((TotTurnArr,np.nan))
+        TotDwellArr = np.hstack((TotDwellArr,OVDwell))
+        TotTurnArr = np.hstack((TotTurnArr,OVAmp))
+
+        MasterDict = self.results #Now fs.results values get made into a mutable dictionary "MasterDict" so I can edit them more easily
+
+        #Recompiling Dictionaries#
+        Processivitydict={"Processivity":Processivity}
+        AverageRatedict = {"average_rate":AverageRateArr}
+        AverageDwelldict = {"average_dwell":AverageDwellArr}
+        AverageWidthdict = {"average_width":AverageWidthArr}
+        DwellStartDict = {"dwell_position":DwellStartArr}
+        StepPositionDict = {"step_position":StepPosArr}
+        TotDwellDict = {"overall_dwell":TotDwellArr}
+        TotTurnDict = {"Total height":TotTurnArr}
+        OVRateDict = {"overall_rate":OVRateArr}
+        MasterDict.update(Processivitydict)
+        MasterDict.update(DwellStartDict)
+        MasterDict.update(StepPositionDict)
+        MasterDict.update(AverageRatedict)
+        MasterDict.update(AverageDwelldict)
+        MasterDict.update(AverageWidthdict)
+        MasterDict.update(TotDwellDict)
+        MasterDict.update(TotTurnDict)
+        MasterDict.update(OVRateDict)
+        if results == True:
+            df = pd.DataFrame(MasterDict)
+            return df
+    
+    ################################################################################################################
+    
+    def spline(self,smth):
+        spl = UnivariateSpline(self.time,self.trace)
+        spl.set_smoothing_factor(smth)
+        return spl
+    
+    ################################################################################################################
+        
+    @property
+    def results(self):
+        params = self.output.params.valuesdict()
+        self.resmask = np.array([],dtype = bool) # Empty Masking Arr
+        results = {"step_height": [], "step_width": [], "dwell_time": [],
+                   "step_rate": [], "step_start": []}
+        for i, _ in enumerate(self.regions):
+            if np.abs(params[f"s{i}_amplitude"]) > self.exclusion:
+                self.resmask = np.hstack((self.resmask,True))
+                results["step_height"].append(params[f"s{i}_amplitude"])
+                results["step_width"].append(params[f"s{i}_sigma"])
+                if i == 0:
+                    results["dwell_time"].append(0)
+                else:
+                    dwell_time = params[f"s{i}_center"] -  \
+                        params[f"s{i-1}_center"] - \
+                        params[f"s{i-1}_sigma"]
+                    results["dwell_time"].append(dwell_time)
+                results["step_rate"].append(params[f"s{i}_amplitude"] /
+                                            params[f"s{i}_sigma"])
+                results["step_start"].append(params[f"s{i}_center"])
+            else:
+                 self.resmask = np.hstack((self.resmask,False))
+        return results
+    
+################################################################################################################
+    
+def findpositives(var,x):
+    boolar = np.array([],dtype = bool)
+    for i in range(len(x)):
+        if var.results['step_height'][i] >= 0:
+            boolar = np.hstack((boolar,True))
+        else:
+            boolar = np.hstack((boolar,False))
+    return boolar
+
+################################################################################################################
+
+def findnegatives(var,x):
+    boolar = np.array([],dtype = bool)
+    negindex = np.array([], dtype = int)
+    for i in range(len(x)):
+        if var.results['step_height'][i] <= 0:
+            boolar = np.hstack((boolar,True))
+            negindex = np.hstack((negindex,i))
+        else:
+            boolar = np.hstack((boolar,False))
+    return (boolar,negindex)
+
+################################################################################################################
+
+def Boxsmooth(data,window):
+    
+    smoothdata = convolve(data, Box1DKernel(window))
+    return smoothdata
+
+################################################################################################################
+
+def FindSGWindowSize(dat = 'default', n = 4, box_comp = False, box_win = 11, plot = False, **kwargs): 
+    x = dat
+    n = 4
+    N1 = 5
+    sigma = st.pstdev(x)
+    print("Data Standard Deviation:",sigma)
+    Nopt = 11
+    i=0
+    while N1 != Nopt:
+        i+=1
+        N1 = int(2*np.floor(Nopt/2))
+        if N1%2 == 0:
+            N1 += 1
+        y = savgol_filter(x,N1,n)
+        ydot = savgol_filter(y,N1,n,deriv=1)
+        s = np.diff(ydot,n = n+1)
+        vn = np.mean(s**2)
+        Nopt = int(np.ceil(np.power(((2*(n+2)*(mth.factorial(2*n+3)**2))/(mth.factorial(n+1)**2))*(sigma**2/vn),(1/(2*n+5)))))
+        if Nopt%2 == 0:
+            Nopt += 1
+    raw = x
+    smthdata = savgol_filter(x,Nopt,n)
+    if plot == True: 
+        fig = plt.figure(figsize=(8,5))
+        dbN = 2*Nopt
+        if dbN%2 == 0:
+            dbN += 1
+        smthdouble = savgol_filter(x,dbN,n)
+        plt.plot(x, color = 'silver', alpha = 0.7, label = "Data", lw=0.75)
+        plt.plot(smthdata, color = 'darkorange', label = "Smoothed, WS: %i" %Nopt, lw=1)
+        plt.plot(smthdouble, color = 'mediumorchid', label = "Smoothed, WS: %i" %dbN, lw=1)
+        if box_comp == True:    
+            boxed = Boxsmooth(x, 31)
+            plt.plot(boxed, label = "Boxcar, WS: 31", lw =1)
+
+        plt.grid()
+        plt.legend()
+    return Nopt
+
+################################################################################################################
+
+def WriteOutput(df,file,headbool):
+    with open(file, 'a', newline = '') as f:
+        df.to_csv(f, index = False, header = headbool)
+
+################################################################################################################
+        
+def WriteOutFile2(table, file):    
+    # Write list of lists to output file since that is how PySimpleGUI uses tables
+    with open(file, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerows(table)
+        
+################################################################################################################        
+        
+def ClearOutFile(file):
+    with open(file, 'r+', newline = '') as f:
+        f.truncate(0)
+
+################################################################################################################        
+        
+def SG_Smoothing(x = 'default', win = 101, order = 4, **kwargs):
+    if x == 'default':
+        x = LoadSelection()
+    else:
+        x = x
+    filtdata = savgol_filter(x, win, order)
+    plt.figure()
+    plt.plot(x)
+    plt.plot(filtdata, color = 'orange')
+    plt.show()
+    return filtdata
+
+################################################################################################################
+    
+def BestTWindow(data):
+    # Input data
+    data = data
+
+    # Initialize window size and best window size
+    window_size = 5
+    best_window_size = 0
+    best_window_size_bic = 0
+    window_array = np.array([])
+    bic_array = np.array([])
+    aic_array = np.array([])
+    bic_tot = 0
+    aic_tot = 0
+    bic_opt = 0
+    aic_opt = 0
+    avg_opt = 0
+    best_window_size_aic = 0
+    best_score = float("inf")
+    count = 0
+    # Loop through different window sizes
+    while window_size <= 100:
+        
+        score_aic = 0
+        score_bic = 0
+        _, p_value = rolling_ttest(data, window_size)
+        # Add the log likelihood to the score
+        score_aic += -2 * np.log(p_value[count])
+        score_bic += -2 * np.log(p_value[count]) + (np.log(window_size) * 2)
+        window_array = np.hstack((window_size,window_array))
+        bic_array = np.hstack((score_bic, bic_array))
+        aic_array = np.hstack((score_aic, aic_array))
+        
+
+        # Update the best window size and best score
+        if score_aic < best_score:
+            best_score = score_aic
+            best_window_size = window_size
+            best_criterion = "AIC"
+        elif score_bic < best_score:
+            best_score = score_bic
+            best_window_size = window_size
+            best_criterion = "BIC"
+        # Increase the window size
+        window_size += 1
+        count += 1
+    
+    bic_tot = np.stack((window_array,bic_array))
+    aic_tot = np.stack((window_array,aic_array))
+    bic_opt = int(bic_tot[0,np.argmin(bic_tot[1,:])])
+    aic_opt = int(aic_tot[0,np.argmin(aic_tot[1,:])])
+    avg_opt = int(np.ceil((bic_opt+aic_opt)/2))
+    # Print the optimal window size
+    #print("Optimal window size using", best_criterion, ":", best_window_size)
+    return avg_opt, bic_opt, aic_opt
+
+
+################################################################################################################
+
+
+def determine_optimal_window_size(data):
+    aic_values = []
+    for window_size in range(2, 200): # loop through window sizes 2 to 10
+        y_pred = np.zeros(len(data) - window_size + 1)
+        for i in range(len(y_pred)):
+            y_pred[i] = np.mean(data[i:i+window_size])
+        t, p = stats.ttest_1samp(data[window_size-1:] - y_pred, 0)
+        if p < 0.05:
+            n = len(data[window_size-1:] - y_pred)
+            k = 2
+            aic = 2 * k - 2 * np.log(np.sum((data[window_size-1:] - y_pred)**2) / n)
+            aic_values.append(aic)
+        else:
+            aic_values.append(np.inf)
+
+    optimal_window_size = np.argmin(aic_values)
+    print("optimal window:", optimal_window_size)
+    return optimal_window_size
